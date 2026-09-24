@@ -64,6 +64,7 @@ app.post("/voice", (req, res) => {
       transcriptionLanguage="multi"
       ttsProvider="ElevenLabs"
       dtmfDetection="true"
+      partialPrompts="true"
       welcomeGreeting="Thanks for calling Chyne Tire! We come to you, by appointment. How can I help?"
     >
       <Language code="en-US" ttsProvider="ElevenLabs" voice="${ENGLISH_VOICE_ID}" />
@@ -214,6 +215,7 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "interrupt") {
+      resetSilenceTimer(); // caller talked over the AI - they're clearly still there
       const last = history[history.length - 1];
       if (last && last.role === "assistant" && typeof last.content === "string") {
         last.content = msg.utteranceUntilInterrupt || last.content;
@@ -234,7 +236,6 @@ wss.on("connection", (ws) => {
         callerNumber,
         requestCount: liveAgentRequestCount,
         draft: draftMessage,
-        transcript: extractTranscript(history),
       }).catch((err) => console.error("Failed to send incomplete-message alert:", err.message));
     }
   });
