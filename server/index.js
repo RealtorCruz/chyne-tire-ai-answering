@@ -30,7 +30,7 @@ app.post("/voice", (req, res) => {
   // REQUIRED MANUAL STEP - see SETUP.md: replace with a real ElevenLabs Spanish voice ID
   // before Spanish will sound native rather than accented. English deliberately has no
   // explicit voice override (uses ConversationRelay/ElevenLabs' own default).
-  const SPANISH_VOICE_ID = "6VhI0BBMzbLqzPaeqUCz";
+  const SPANISH_VOICE_ID = "SPANISH_VOICE_ID";
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
