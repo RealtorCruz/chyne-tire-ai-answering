@@ -176,7 +176,14 @@ wss.on("connection", (ws) => {
         }
         console.log(`Call ${callSid}: detected lang=${msg.lang} -> using ${currentTtsLanguage}`);
 
-        history.push({ role: "user", content: msg.voicePrompt });
+        // If the last turn is a pending tool_result (a save the AI made while speaking),
+        // attach the caller's words to it instead of adding a second back-to-back user turn.
+        const lastTurn = history[history.length - 1];
+        if (lastTurn && lastTurn.role === "user" && Array.isArray(lastTurn.content)) {
+          lastTurn.content.push({ type: "text", text: msg.voicePrompt });
+        } else {
+          history.push({ role: "user", content: msg.voicePrompt });
+        }
         await respond(ws, history, "voice", callerNumber);
       }
       return;
@@ -188,16 +195,19 @@ wss.on("connection", (ws) => {
       if (!liveAgentEscalationTriggered && dtmfBuffer === "000") {
         liveAgentEscalationTriggered = true;
         console.log(`Call ${callSid}: caller pressed 0-0-0, triggering live-agent escalation`);
-        history.push({
-          role: "user",
-          content:
+        const noteText =
             "[System note: caller just pressed 0-0-0 on their keypad, which immediately " +
             "requests a live person regardless of how many times they've asked verbally. " +
             "Begin the escalation script now: acknowledge the request, briefly explain you " +
             "need a few details to set up a callback, then ask for their name and best time " +
             "to call back together in one question. Follow the normal read-back-and-confirm " +
-            "flow before recording, and end the call once it's taken.",
-        });
+            "flow before recording, and end the call once it's taken.";
+        const prevTurn = history[history.length - 1];
+        if (prevTurn && prevTurn.role === "user" && Array.isArray(prevTurn.content)) {
+          prevTurn.content.push({ type: "text", text: noteText });
+        } else {
+          history.push({ role: "user", content: noteText });
+        }
         await respond(ws, history, "voice", callerNumber);
       }
       return;
@@ -284,6 +294,12 @@ wss.on("connection", (ws) => {
           role: "user",
           content: [{ type: "tool_result", tool_use_id: saveProgressToolUse.id, content: "Saved." }],
         });
+        // If the AI already spoke in this same turn (the normal Sonnet pattern: talk + save
+        // together), DON'T prompt it again - that's what made it repeat itself. Just wait
+        // for the caller; their next words get attached to this tool_result turn (see the
+        // "prompt" handler). Only re-prompt if the save was silent, so the caller isn't
+        // left in dead air.
+        if (fullText.trim()) return;
         await respond(ws, history, channel, callerNumber);
         return;
       }
