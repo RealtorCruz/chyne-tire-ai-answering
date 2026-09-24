@@ -27,6 +27,29 @@ const { loadConversation, saveConversation } = require("../../server/conversatio
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ---- Prompt caching (cuts Sonnet input cost) ----
+// Persona + tools are identical on every request, so they're sent as a cached block
+// (re-read at ~10% of normal input price after the first write). A second breakpoint on
+// the newest turn lets the earlier part of the thread be re-read from cache too.
+const CACHED_SYSTEM = [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }];
+
+// Returns a copy of the history with a cache breakpoint on the last content block.
+// Never mutates the saved history, so breakpoints never get stored in Netlify Blobs.
+function withCacheBreakpoint(history) {
+  if (history.length === 0) return history;
+  const copy = history.slice(0, -1);
+  const last = history[history.length - 1];
+  const blocks =
+    typeof last.content === "string"
+      ? [{ type: "text", text: last.content }]
+      : last.content.map((b) => ({ ...b }));
+  if (blocks.length > 0) {
+    blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], cache_control: { type: "ephemeral" } };
+  }
+  copy.push({ role: last.role, content: blocks });
+  return copy;
+}
+
 async function notifyOwner(summary) {
   try {
     const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
@@ -43,9 +66,19 @@ async function notifyOwner(summary) {
 exports.handler = async (event) => {
   const params = new URLSearchParams(event.body);
   const from = params.get("From");
-  const bodyText = params.get("Body");
+  const bodyText = (params.get("Body") || "").trim();
 
-  if (!from || !bodyText) {
+  // Photo texts (MMS): customers will often send a picture of their registration card or
+  // VIN sticker instead of typing it. The AI doesn't read the photo - Chyne Tire does -
+  // so we just forward the photo link(s) to the owner and have the AI thank them.
+  const numMedia = parseInt(params.get("NumMedia") || "0", 10);
+  const mediaUrls = [];
+  for (let i = 0; i < numMedia; i++) {
+    const url = params.get(`MediaUrl${i}`);
+    if (url) mediaUrls.push(url);
+  }
+
+  if (!from || (!bodyText && mediaUrls.length === 0)) {
     return { statusCode: 400, body: "Missing From/Body" };
   }
 
@@ -55,7 +88,24 @@ exports.handler = async (event) => {
   const existing = await loadConversation(from);
   const state = existing || { history: [], captured: {}, awaitingVehicleId: false };
 
-  state.history.push({ role: "user", content: bodyText });
+  if (mediaUrls.length > 0) {
+    const c = state.captured || {};
+    await notifyOwner(`Photo received via AI text for ${c.name || "a customer"} (likely VIN or registration):
+${mediaUrls.join("\n")}
+Vehicle on file: ${c.vehicle_year || ""} ${c.vehicle_make || ""} ${c.vehicle_model || ""}${bodyText ? `\nTheir message: ${bodyText}` : ""}
+From: ${from}`);
+    state.awaitingVehicleId = false;
+
+    const note =
+      `[System note: the customer just sent ${mediaUrls.length === 1 ? "a photo" : mediaUrls.length + " photos"}, ` +
+      `most likely of their VIN or registration. It has ALREADY been forwarded to Chyne Tire - treat the ` +
+      `vehicle ID as received. Do NOT call record_vehicle_id for it and do NOT ask them to type it. ` +
+      `Thank them by name and let them know Chyne Tire has what's needed to get the right tires ready. ` +
+      `If they also wrote a message, respond to that naturally too.]`;
+    state.history.push({ role: "user", content: bodyText ? `${note}\n\n${bodyText}` : note });
+  } else {
+    state.history.push({ role: "user", content: bodyText });
+  }
 
   let replyText = "Sorry, something went wrong on our end. Please try again in a bit.";
 
@@ -64,12 +114,19 @@ exports.handler = async (event) => {
     // ever needs one or two rounds, capped at 3 as a safety backstop.
     for (let round = 0; round < 3; round++) {
       const message = await anthropic.messages.create({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5",
         max_tokens: 300,
-        system: SYSTEM_PROMPT,
+        system: CACHED_SYSTEM,
         tools: [TAKE_MESSAGE_TOOL, RECORD_VEHICLE_ID_TOOL, REQUEST_LIVE_AGENT_TOOL],
-        messages: state.history,
+        messages: withCacheBreakpoint(state.history),
       });
+
+      // Token/cache usage - check Netlify Function logs to confirm caching is working.
+      const u = message.usage || {};
+      console.log(
+        `SMS ${from} tokens: input=${u.input_tokens} cache_write=${u.cache_creation_input_tokens || 0} ` +
+          `cache_read=${u.cache_read_input_tokens || 0} output=${u.output_tokens}`
+      );
 
       const cleanContent = message.content.filter((b) => b.type !== "thinking" && b.type !== "redacted_thinking");
       state.history.push({ role: "assistant", content: cleanContent });
