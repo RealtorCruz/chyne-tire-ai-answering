@@ -27,10 +27,10 @@ const PUBLIC_HOSTNAME = process.env.PUBLIC_HOSTNAME;
 // ---- 1. Voice webhook: Twilio hits this when a call comes in ----
 app.post("/voice", (req, res) => {
   const wsUrl = `wss://${PUBLIC_HOSTNAME}/relay`;
-  // REQUIRED MANUAL STEP - see SETUP.md: replace with a real ElevenLabs Spanish voice ID
-  // before Spanish will sound native rather than accented. English deliberately has no
-  // explicit voice override (uses ConversationRelay/ElevenLabs' own default).
-  const SPANISH_VOICE_ID = "SPANISH_VOICE_ID";
+  // Native Spanish ElevenLabs voice (same one the real estate line uses). No ElevenLabs
+  // account needed - Twilio ConversationRelay provides ElevenLabs voices directly.
+  // English deliberately has no explicit voice override (uses the default).
+  const SPANISH_VOICE_ID = "6VhI0BBMzbLqzPaeqUCz";
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -43,7 +43,7 @@ app.post("/voice", (req, res) => {
       welcomeGreeting="Thanks for calling Chyne Tire! We come to you, by appointment. How can I help?"
     >
       <Language code="en-US" ttsProvider="ElevenLabs" />
-      <Language code="es-US" ttsProvider="ElevenLabs" voice="${6VhI0BBMzbLqzPaeqUCz}" />
+      <Language code="es-US" ttsProvider="ElevenLabs" voice="${SPANISH_VOICE_ID}" />
     </ConversationRelay>
   </Connect>
 </Response>`;
