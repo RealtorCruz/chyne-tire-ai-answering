@@ -16,10 +16,19 @@
 
 const twilio = require("twilio");
 
-async function sendSms(to, body) {
+async function sendSms(to, body, mediaUrl) {
   const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-  await client.messages.create({ from: process.env.TWILIO_PHONE_NUMBER, to, body });
+  const params = { from: process.env.TWILIO_PHONE_NUMBER, to, body };
+  if (mediaUrl) params.mediaUrl = [mediaUrl];
+  await client.messages.create(params);
 }
+
+// Public URL of the door-jamb reference photo, served as a static file from this same
+// Netlify site (see /assets/doorjamb-sticker.jpg in the repo). ~86KB -> costs about
+// $0.04 per send (Twilio MMS: $0.02 base + $0.02/100KB), only sent when tire size is
+// unknown. Update DOORJAMB_PHOTO_HOST if the Netlify site name ever changes.
+const DOORJAMB_PHOTO_HOST = process.env.DOORJAMB_PHOTO_HOST || "https://chyne-tire-ai-answering.netlify.app";
+const DOORJAMB_PHOTO_URL = `${DOORJAMB_PHOTO_HOST}/assets/doorjamb-sticker.jpg`;
 
 function vehicleText(lead) {
   const v = [lead.vehicle_year, lead.vehicle_make, lead.vehicle_model]
@@ -42,11 +51,11 @@ function formatLeadCard(lead, { phone, updated, header }) {
   );
   lines.push(`Service address: ${lead.service_address || "pending - asked by text"}`);
 
-  let vehicleId = "pending - asked by text";
-  if (lead.vin) vehicleId = `VIN ${lead.vin}`;
-  else if (lead.plate) vehicleId = `Plate ${lead.plate}${lead.plate_state ? ` (${lead.plate_state})` : ""}`;
-  else if (lead.photo_urls && lead.photo_urls.length) vehicleId = `photo sent:\n${lead.photo_urls.join("\n")}`;
-  lines.push(`VIN/plate: ${vehicleId}`);
+  // Always shown - the confirmation photo is now always requested, whether or not a
+  // tire size was given, since a stated size isn't always the one actually on the car.
+  let photoStatus = "pending - asked by text";
+  if (lead.photo_urls && lead.photo_urls.length) photoStatus = `door-jamb sticker sent:\n${lead.photo_urls.join("\n")}`;
+  lines.push(`Confirmation photo: ${photoStatus}`);
 
   lines.push(`Callback: ${lead.best_callback_time || "no preference given"}`);
   if (lead.notes) lines.push(`Notes: ${lead.notes}`);
@@ -110,27 +119,40 @@ async function notifyIncompleteMessage({ callerNumber, requestCount, draft }) {
 // call was in Spanish.
 async function sendFollowupRequestText({ toNumber, lead, lang }) {
   const name = lead.name || "";
-  const vehicle = vehicleText(lead);
   const needAddress = !lead.service_address;
+  // Always requested unless a photo has already come in on this thread - not conditional
+  // on whether a tire size was given, since a stated size can still be wrong for the car.
+  const needPhoto = !(lead.photo_urls && lead.photo_urls.length);
   const spanish = lang && lang.startsWith("es");
 
+  // Framed as "so we get you the right tires" rather than a task to complete - the
+  // attached photo (see DOORJAMB_PHOTO_URL) is what "shows how simple it is" refers to.
   let body;
-  if (spanish) {
-    // Proper accents on purpose - unaccented Spanish reads as sloppy to a Spanish
-    // speaker. Costs an extra segment or so (UCS-2), only on Spanish-language calls.
-    body =
-      `Hola ${name}, le escribe Chyne Tire. Para traer las llantas correctas para su ${vehicle}, ` +
-      `¿nos puede enviar su número VIN o su placa y estado` +
-      (needAddress ? `, y la dirección donde estará el vehículo cuando vayamos?` : `?`);
+  if (needPhoto && needAddress) {
+    body = spanish
+      ? `Hola ${name}, le escribe Chyne Tire. Para asegurarnos de conseguirle las llantas correctas, le compartimos una foto que muestra lo fácil que es encontrar el tamaño exacto de sus llantas. ¿Nos puede enviar también la dirección donde estará el vehículo cuando vayamos?`
+      : `Hi ${name}, this is Chyne Tire! So we make sure we get you the tires that are right for you, here's a picture showing how simple it is to find your exact tire size. Can you also send over the address where the vehicle will be when we come out?`;
+  } else if (needPhoto) {
+    body = spanish
+      ? `Hola ${name}, le escribe Chyne Tire. Para asegurarnos de conseguirle las llantas correctas, le compartimos una foto que muestra lo fácil que es encontrar el tamaño exacto de sus llantas.`
+      : `Hi ${name}, this is Chyne Tire! So we make sure we get you the tires that are right for you, here's a picture showing how simple it is to find your exact tire size.`;
+  } else if (needAddress) {
+    body = spanish
+      ? `Hola ${name}, le escribe Chyne Tire. ¿Nos puede enviar la dirección donde estará el vehículo cuando vayamos?`
+      : `Hi ${name}, this is Chyne Tire! Can you send over the address where the vehicle will be when we come out?`;
   } else {
-    body =
-      `Hi ${name}, this is Chyne Tire! To bring the exact right tires for your ${vehicle}, ` +
-      `text us your VIN or license plate and state` +
-      (needAddress ? `, plus the address where the vehicle will be when we come out.` : `.`);
+    // Shouldn't normally happen (both already known), but keep a safe fallback.
+    body = spanish
+      ? `Gracias ${name}, ¡ya tenemos todo lo que necesitamos! Chyne Tire se pondrá en contacto pronto.`
+      : `Thanks ${name}, we've got everything we need! Chyne Tire will be in touch soon.`;
   }
 
+  // Attach the reference photo only when a door-jamb photo is actually being asked for -
+  // the address-only message needs no picture.
+  const mediaUrl = needPhoto ? DOORJAMB_PHOTO_URL : undefined;
+
   try {
-    await sendSms(toNumber, body);
+    await sendSms(toNumber, body, mediaUrl);
     return { status: "sent", body };
   } catch (err) {
     console.error("Failed to send follow-up request text:", err.message);
