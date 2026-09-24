@@ -342,13 +342,17 @@ wss.on("connection", (ws) => {
 
         logCustomerField({ phone: callerNumber, ...lead, source: "AI Call" });
 
-        // Kick off the follow-up text thread (VIN/plate + service address). The send is
-        // fire-and-forget, but seeding conversationStore happens right after so a
-        // customer who replies quickly still lands in the right thread.
+        // Kick off the follow-up text thread (service address, and a confirmation photo -
+        // always requested, not just when tire size is unknown, since a stated size can
+        // still be wrong for the car). The send is fire-and-forget, but seeding
+        // conversationStore happens right after so a customer who replies quickly still
+        // lands in the right thread.
+        const needAddress = !lead.service_address;
+        const needPhoto = true; // no photo could exist yet at voice intake time
         sendFollowupRequestText({ toNumber: callerNumber, lead, lang: currentTtsLanguage })
           .then(async (result) => {
-            const needAddress = !lead.service_address;
-            const still = ["their VIN or license plate + state"];
+            const still = [];
+            if (needPhoto) still.push("a photo of the driver's-side door-jamb sticker (to double-check the tire size)");
             if (needAddress) still.push("the full address where the vehicle will be for service");
             // The Messages API requires the FIRST turn to be role "user", so a synthetic
             // system-note user turn goes ahead of the outbound text. It also gives the
@@ -366,7 +370,9 @@ wss.on("connection", (ws) => {
                     `${lead.service_address ? `service address ${lead.service_address}, ` : ""}` +
                     `best callback time "${lead.best_callback_time || "no preference given"}". ` +
                     `The call was in ${currentTtsLanguage.startsWith("es") ? "Spanish" : "English"}. ` +
-                    `You just texted them asking for ${still.join(" and ")}. ` +
+                    (still.length
+                      ? `You just texted them asking for ${still.join(" and ")}. `
+                      : `You already have everything needed, no follow-up ask was sent. `) +
                     `Do not respond to this note itself - it's context for whatever they text next.]`,
                 },
                 {
@@ -375,23 +381,25 @@ wss.on("connection", (ws) => {
                 },
               ],
               captured: lead,
-              awaitingVehicleId: true,
+              awaitingTireSizePhoto: needPhoto,
               awaitingAddress: needAddress,
               followupNudged: false,
             });
           })
           .catch((err) => console.error("Failed to seed conversation state after voice intake:", err.message));
 
+        const explainParts = [];
+        if (needPhoto) explainParts.push("a quick photo of the sticker inside the driver's side door to double-check the tire size");
+        if (needAddress) explainParts.push("the address where the vehicle will be");
         history.push({
           role: "user",
           content: [
             {
               type: "tool_result",
               tool_use_id: toolUse.id,
-              content:
-                "Lead recorded. Now explain (out loud - don't collect either on this call) that Chyne Tire will text them shortly asking for their VIN or license plate" +
-                (lead.service_address ? "" : " and the address where the vehicle will be") +
-                ", then say goodbye and end the call.",
+              content: explainParts.length
+                ? `Lead recorded. Now explain (out loud - don't collect this on the call) that Chyne Tire will text them shortly asking for ${explainParts.join(" and ")}, then say goodbye and end the call.`
+                : "Lead recorded. Now let them know Chyne Tire has everything needed and will be in touch, then say goodbye and end the call.",
             },
           ],
         });
