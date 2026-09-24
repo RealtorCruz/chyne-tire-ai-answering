@@ -29,9 +29,11 @@ function vehicleText(lead) {
 }
 
 // Builds the full lead card from everything known so far.
-function formatLeadCard(lead, { phone, updated }) {
+function formatLeadCard(lead, { phone, updated, header }) {
   const lines = [];
-  lines.push(`${lead.urgent ? "URGENT - " : ""}${updated ? "UPDATED" : "NEW"} TIRE LEAD - ${lead.name || "Unknown"}`);
+  lines.push(
+    `${lead.urgent ? "URGENT - " : ""}${header || (updated ? "UPDATED TIRE LEAD" : "NEW TIRE LEAD")} - ${lead.name || "Unknown"}`
+  );
   lines.push(vehicleText(lead));
   lines.push(`Needs: ${lead.reason || "not given"}${lead.quantity ? ` (qty: ${lead.quantity})` : ""}`);
   lines.push(`Tire size: ${lead.tire_size || "unknown"}`);
@@ -76,20 +78,25 @@ async function notifyLeadUpdated({ lead, callerNumber }) {
 }
 
 // Fallback alert for a call that ended before take_message was ever confirmed
-// (dropped call, hang-up, or a live-agent request that never finished).
-async function notifyIncompleteMessage({ callerNumber, requestCount, draft, transcript }) {
-  const draftLines = Object.entries(draft || {})
-    .map(([k, v]) => `  ${k}: ${v}`)
-    .join("\n");
-  const summary = `POSSIBLE MISSED LEAD:
-${callerNumber} ${requestCount > 0 ? `asked to speak with you directly (${requestCount}x) ` : ""}then the call ended before a full message was confirmed.
-Captured so far:
-${draftLines || "  (nothing captured yet)"}
-Recent transcript:
-${transcript || "(none)"}`;
+// (dropped call, hang-up, or a live-agent request that never finished). Same lead-card
+// format as every other alert - no transcript, since a transcript can run 7+ segments
+// per alert and the captured fields are the part the owner actually needs.
+async function notifyIncompleteMessage({ callerNumber, requestCount, draft }) {
+  const lead = { ...(draft || {}), channel: "call" };
+  const card = formatLeadCard(lead, { phone: callerNumber, header: "POSSIBLE MISSED LEAD" }).split("\n");
+  const why =
+    requestCount > 0
+      ? `(asked to speak with you directly ${requestCount}x, then the call ended before details were confirmed)`
+      : "(call ended before the details were confirmed)";
+  card.splice(1, 0, why);
+  // A missed lead never got the follow-up text, so these aren't "asked by text" - just missing.
+  const body = card
+    .join("\n")
+    .replace(/pending - asked by text/g, "not captured")
+    .replace(/Came in by: call/, "Came in by: call (no follow-up text sent)");
 
   try {
-    await sendSms(process.env.OWNER_CELL_NUMBER, summary);
+    await sendSms(process.env.OWNER_CELL_NUMBER, body);
     return "sent";
   } catch (err) {
     console.error("Failed to send incomplete-message alert:", err.message);
