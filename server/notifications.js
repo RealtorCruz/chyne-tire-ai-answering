@@ -127,15 +127,28 @@ async function sendFollowupRequestText({ toNumber, lead, lang }) {
 
   // Framed as "so we get you the right tires" rather than a task to complete - the
   // attached photo (see DOORJAMB_PHOTO_URL) is what "shows how simple it is" refers to.
+  // If the address was already given (on the call, most likely by speech-to-text),
+  // confirm it back in writing as a backstop to the voice read-back - a garbled house
+  // number or apartment letter is easy to mishear and costly to get wrong (Chyne Tire
+  // shows up at the wrong place). This line is added onto whichever message goes out,
+  // never sent as its own separate text.
+  const addressConfirmLine = !needAddress
+    ? spanish
+      ? ` Tenemos su dirección como: ${lead.service_address} - avísenos si no es correcta.`
+      : ` We have your address as: ${lead.service_address} - let us know if that's not right.`
+    : "";
+
   let body;
   if (needPhoto && needAddress) {
     body = spanish
       ? `Hola ${name}, le escribe Chyne Tire. Para asegurarnos de conseguirle las llantas correctas, le compartimos una foto que muestra lo fácil que es encontrar el tamaño exacto de sus llantas. ¿Nos puede enviar también la dirección donde estará el vehículo cuando vayamos?`
       : `Hi ${name}, this is Chyne Tire! So we make sure we get you the tires that are right for you, here's a picture showing how simple it is to find your exact tire size. Can you also send over the address where the vehicle will be when we come out?`;
   } else if (needPhoto) {
-    body = spanish
-      ? `Hola ${name}, le escribe Chyne Tire. Para asegurarnos de conseguirle las llantas correctas, le compartimos una foto que muestra lo fácil que es encontrar el tamaño exacto de sus llantas.`
-      : `Hi ${name}, this is Chyne Tire! So we make sure we get you the tires that are right for you, here's a picture showing how simple it is to find your exact tire size.`;
+    body =
+      (spanish
+        ? `Hola ${name}, le escribe Chyne Tire. Para asegurarnos de conseguirle las llantas correctas, le compartimos una foto que muestra lo fácil que es encontrar el tamaño exacto de sus llantas.`
+        : `Hi ${name}, this is Chyne Tire! So we make sure we get you the tires that are right for you, here's a picture showing how simple it is to find your exact tire size.`) +
+      addressConfirmLine;
   } else if (needAddress) {
     body = spanish
       ? `Hola ${name}, le escribe Chyne Tire. ¿Nos puede enviar la dirección donde estará el vehículo cuando vayamos?`
