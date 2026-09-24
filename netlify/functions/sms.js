@@ -55,7 +55,7 @@ function withCacheBreakpoint(history) {
 // Each missing piece gets asked for ONCE - after that the owner gets it on the callback.
 function followupStatus(state) {
   const missing = [];
-  if (state.awaitingVehicleId) missing.push("their VIN or license plate + state");
+  if (state.awaitingTireSizePhoto) missing.push("a photo of the door-jamb tire size sticker");
   if (state.awaitingAddress) missing.push("the full address where the vehicle will be for service");
   if (missing.length === 0) {
     return "Everything's in. Thank them by name and let them know Chyne Tire has what it needs and will reach out to get them scheduled.";
@@ -90,7 +90,7 @@ exports.handler = async (event) => {
   // conversation (null), a text thread already in progress, OR a thread seeded by the
   // voice server after a phone call (see index.js's take_message handler).
   const existing = await loadConversation(from);
-  const state = existing || { history: [], captured: {}, awaitingVehicleId: false };
+  const state = existing || { history: [], captured: {}, awaitingTireSizePhoto: false, awaitingAddress: false };
 
   if (mediaUrls.length > 0) {
     state.captured = state.captured || {};
@@ -98,14 +98,15 @@ exports.handler = async (event) => {
     if (bodyText) {
       state.captured.notes = [state.captured.notes, `Texted with photo: ${bodyText}`].filter(Boolean).join("; ");
     }
-    state.awaitingVehicleId = false; // the photo covers the VIN/plate - the owner reads it himself
+    state.awaitingTireSizePhoto = false; // the door-jamb photo is in - the owner reads the size himself
     await notifyLeadUpdated({ lead: state.captured, callerNumber: from });
 
     const note =
       `[System note: the customer just sent ${mediaUrls.length === 1 ? "a photo" : mediaUrls.length + " photos"}, ` +
-      `most likely of their VIN or registration. It has ALREADY been forwarded to Chyne Tire - treat the ` +
-      `vehicle ID as received and do NOT ask them to type it. If their message includes the service ` +
-      `address, call record_followup_info with just service_address. Otherwise: ${followupStatus(state)}]`;
+      `most likely of the door-jamb tire size sticker you asked for. It has ALREADY been forwarded to Chyne ` +
+      `Tire - treat the tire size as received and do NOT ask them to type it out. If their message includes ` +
+      `the service address, call record_followup_info with service_address (and photo: true). Otherwise call ` +
+      `record_followup_info with just photo: true. ${followupStatus(state)}]`;
     state.history.push({ role: "user", content: bodyText ? `${note}\n\n${bodyText}` : note });
   } else {
     state.history.push({ role: "user", content: bodyText });
@@ -164,12 +165,14 @@ exports.handler = async (event) => {
         logCustomerField({ phone: from, ...lead, source: "AI Text" });
 
         state.captured = lead;
-        state.awaitingVehicleId = !(lead.vin || lead.plate || (lead.photo_urls && lead.photo_urls.length));
+        // Always requested unless a photo already came in on this thread - not conditional
+        // on whether a tire size was given, since a stated size can still be wrong.
+        state.awaitingTireSizePhoto = !(lead.photo_urls && lead.photo_urls.length);
         state.awaitingAddress = !lead.service_address;
         state.followupNudged = true; // this next message IS the one ask
 
         const ask = [];
-        if (state.awaitingVehicleId) ask.push("their VIN or license plate + state");
+        if (state.awaitingTireSizePhoto) ask.push("a photo of the door-jamb tire size sticker");
         if (state.awaitingAddress) ask.push("the address where the vehicle will be when Chyne Tire comes out");
 
         state.history.push({
@@ -189,18 +192,21 @@ exports.handler = async (event) => {
 
       const followupToolUse = message.content.find((b) => b.type === "tool_use" && b.name === "record_followup_info");
       if (followupToolUse) {
-        const { vin, plate, plate_state, service_address } = followupToolUse.input;
+        const { service_address } = followupToolUse.input;
         state.captured = state.captured || {};
-        if (vin) state.captured.vin = vin;
-        if (plate) state.captured.plate = plate;
-        if (plate_state) state.captured.plate_state = plate_state;
+        // photo: true is informational only - the photo-receipt branch above already
+        // recorded photo_urls, flipped awaitingTireSizePhoto, and sent the owner an
+        // UPDATED card for it. Sending another alert here for the same photo would
+        // double-charge for one event, so only alert again if there's something NEW
+        // (the address) to report.
+        const addressIsNew = service_address && service_address !== state.captured.service_address;
         if (service_address) state.captured.service_address = service_address;
 
         const c = state.captured;
-        state.awaitingVehicleId = !(c.vin || c.plate || (c.photo_urls && c.photo_urls.length));
+        state.awaitingTireSizePhoto = !(c.photo_urls && c.photo_urls.length);
         state.awaitingAddress = !c.service_address;
 
-        await notifyLeadUpdated({ lead: c, callerNumber: from });
+        if (addressIsNew) await notifyLeadUpdated({ lead: c, callerNumber: from });
         logCustomerField({ phone: from, ...c, source: "AI Text" });
 
         state.history.push({
