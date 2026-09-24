@@ -20,6 +20,30 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// ---- Prompt caching (cuts Sonnet input cost) ----
+// The persona + tool definitions are identical on every turn of every call, so they're
+// sent as a cached block: after the first write, Sonnet re-reads them at ~10% of normal
+// input price. A second cache breakpoint on the newest turn lets each turn re-read the
+// earlier part of the conversation from cache instead of paying full price for it again.
+const CACHED_SYSTEM = [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }];
+
+// Returns a copy of the history with a cache breakpoint on the last content block.
+// Never mutates the real history, so breakpoints don't pile up turn after turn.
+function withCacheBreakpoint(history) {
+  if (history.length === 0) return history;
+  const copy = history.slice(0, -1);
+  const last = history[history.length - 1];
+  const blocks =
+    typeof last.content === "string"
+      ? [{ type: "text", text: last.content }]
+      : last.content.map((b) => ({ ...b }));
+  if (blocks.length > 0) {
+    blocks[blocks.length - 1] = { ...blocks[blocks.length - 1], cache_control: { type: "ephemeral" } };
+  }
+  copy.push({ role: last.role, content: blocks });
+  return copy;
+}
+
 const PORT = process.env.PORT || 3000;
 // Set this to your deployed Railway URL once you have it, e.g. chyne-tire-ai-answering.up.railway.app
 const PUBLIC_HOSTNAME = process.env.PUBLIC_HOSTNAME;
@@ -208,11 +232,11 @@ wss.on("connection", (ws) => {
   async function respond(ws, history, channel, callerNumber) {
     try {
       const stream = anthropic.messages.stream({
-        model: "claude-haiku-4-5-20251001",
+        model: "claude-sonnet-5",
         max_tokens: 400,
-        system: SYSTEM_PROMPT,
+        system: CACHED_SYSTEM,
         tools: [TAKE_MESSAGE_TOOL, END_CALL_TOOL, REQUEST_LIVE_AGENT_TOOL, SAVE_PROGRESS_TOOL],
-        messages: history,
+        messages: withCacheBreakpoint(history),
       });
 
       let fullText = "";
@@ -229,6 +253,14 @@ wss.on("connection", (ws) => {
       });
 
       const finalMessage = await stream.finalMessage();
+
+      // Token/cache usage per turn - check Railway Deploy Logs to confirm caching is working
+      // (cache_read should be large and input small after the first turn).
+      const u = finalMessage.usage || {};
+      console.log(
+        `Call ${callSid} tokens: input=${u.input_tokens} cache_write=${u.cache_creation_input_tokens || 0} ` +
+          `cache_read=${u.cache_read_input_tokens || 0} output=${u.output_tokens}`
+      );
 
       ws.send(JSON.stringify({ type: "text", token: "", last: true, lang: currentTtsLanguage }));
 
