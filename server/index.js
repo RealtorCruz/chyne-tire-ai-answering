@@ -81,39 +81,29 @@ app.get("/", (req, res) => res.send("Chyne Tire AI answering - voice server is r
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/relay" });
 
-// Pulls plain spoken text out of the raw Claude message history for the missed-escalation
-// fallback alert. Caps to the last few turns since only the tail end right before a
-// hangup is relevant.
-function extractTranscript(history, maxTurns = 10) {
-  const lines = [];
-  for (const turn of history.slice(-maxTurns)) {
-    const speaker = turn.role === "user" ? "Caller" : "AI";
-    let text = "";
-    if (typeof turn.content === "string") {
-      text = turn.content.replace(/^\[System note[^\]]*\]\s*/, "");
-    } else if (Array.isArray(turn.content)) {
-      text = turn.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join(" ");
-    }
-    text = text.trim();
-    if (text) lines.push(`${speaker}: ${text}`);
-  }
-  return lines.join("\n");
-}
-
 wss.on("connection", (ws) => {
   // Conversation history is per-call, kept only in memory for the life of the call -
   // that's fine for VOICE, since a call is one continuous session with no "hours later"
   // gap. It's the TEXT side (netlify/functions/sms.js) that needs real persistence,
-  // since a customer can reply to the vehicle-ID follow-up text days later.
+  // since a customer can reply to the follow-up text (photo/address) days later.
   let history = [];
   let callSid = null;
   let callerNumber = null;
 
   let callEnding = false;
   let messageTaken = false;
+
+  // Guards against two responses generating at once. Twilio can deliver two separate
+  // "prompt" events in quick succession (the caller spoke twice, or one utterance got
+  // split into two). Without this, a second respond() could start - and push the
+  // caller's new words into `history` - before the first respond() finishes appending
+  // its assistant turn, breaking the required user/assistant/user/... alternation. That
+  // corruption is what caused the AI to repeat itself with two slightly different
+  // answers to the same thing. While `responding` is true, new caller speech is held in
+  // `pendingCallerText` (NOT yet pushed to history) and only added, in order, once the
+  // in-flight response has safely landed its assistant turn.
+  let responding = false;
+  let pendingCallerText = [];
 
   let liveAgentRequestCount = 0;
   let dtmfBuffer = "";
@@ -179,6 +169,15 @@ wss.on("connection", (ws) => {
         console.log(`Call ${callSid}: detected lang=${msg.lang} -> using ${currentTtsLanguage}`);
         console.log(`Call ${callSid} CALLER: ${msg.voicePrompt}`);
 
+        if (responding) {
+          // A response is already being generated for what the caller said a moment ago.
+          // Hold this new bit of speech - do NOT touch history yet - and it'll be added
+          // right after the in-flight turn finishes, in the correct order.
+          console.log(`Call ${callSid}: caller spoke again mid-response, queueing: "${msg.voicePrompt}"`);
+          pendingCallerText.push(msg.voicePrompt);
+          return;
+        }
+
         // If the last turn is a pending tool_result (a save the AI made while speaking),
         // attach the caller's words to it instead of adding a second back-to-back user turn.
         const lastTurn = history[history.length - 1];
@@ -187,7 +186,7 @@ wss.on("connection", (ws) => {
         } else {
           history.push({ role: "user", content: msg.voicePrompt });
         }
-        await respond(ws, history, "voice", callerNumber);
+        await runResponse();
       }
       return;
     }
@@ -205,13 +204,19 @@ wss.on("connection", (ws) => {
             "need a few details to set up a callback, then ask for their name and best time " +
             "to call back together in one question. Follow the normal read-back-and-confirm " +
             "flow before recording, and end the call once it's taken.";
-        const prevTurn = history[history.length - 1];
-        if (prevTurn && prevTurn.role === "user" && Array.isArray(prevTurn.content)) {
-          prevTurn.content.push({ type: "text", text: noteText });
+        if (responding) {
+          // Same race as the prompt handler - hold it rather than risk corrupting history
+          // while a response is already in flight.
+          pendingCallerText.push(noteText);
         } else {
-          history.push({ role: "user", content: noteText });
+          const prevTurn = history[history.length - 1];
+          if (prevTurn && prevTurn.role === "user" && Array.isArray(prevTurn.content)) {
+            prevTurn.content.push({ type: "text", text: noteText });
+          } else {
+            history.push({ role: "user", content: noteText });
+          }
+          await runResponse();
         }
-        await respond(ws, history, "voice", callerNumber);
       }
       return;
     }
@@ -242,6 +247,31 @@ wss.on("connection", (ws) => {
       }).catch((err) => console.error("Failed to send incomplete-message alert:", err.message));
     }
   });
+
+  // Wraps respond() with the concurrency lock: sets `responding` for the duration of one
+  // full turn (through the assistant reply landing in history), then flushes anything the
+  // caller said in the meantime as a new, properly-ordered turn - never dropped, never
+  // interleaved mid-turn.
+  async function runResponse() {
+    responding = true;
+    try {
+      await respond(ws, history, "voice", callerNumber);
+    } finally {
+      responding = false;
+    }
+    if (pendingCallerText.length > 0) {
+      const combined = pendingCallerText.join(" ");
+      pendingCallerText = [];
+      console.log(`Call ${callSid}: flushing queued caller speech: "${combined}"`);
+      const lastTurn = history[history.length - 1];
+      if (lastTurn && lastTurn.role === "user" && Array.isArray(lastTurn.content)) {
+        lastTurn.content.push({ type: "text", text: combined });
+      } else {
+        history.push({ role: "user", content: combined });
+      }
+      await runResponse();
+    }
+  }
 
   async function respond(ws, history, channel, callerNumber) {
     try {
@@ -431,10 +461,13 @@ wss.on("connection", (ws) => {
       }
     } catch (err) {
       console.error("Error generating response:", err);
+      const errorMessage = currentTtsLanguage.startsWith("es")
+        ? "Lo siento, estoy teniendo problemas en este momento. Por favor intente llamar de nuevo en unos minutos."
+        : "Sorry, I'm having trouble right now. Please try calling back in a few minutes.";
       ws.send(
         JSON.stringify({
           type: "text",
-          token: "Sorry, I'm having trouble right now. Please try calling back in a few minutes.",
+          token: errorMessage,
           last: true,
           lang: currentTtsLanguage,
         })
