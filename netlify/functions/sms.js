@@ -19,10 +19,11 @@ const twilio = require("twilio");
 const {
   SYSTEM_PROMPT,
   TAKE_MESSAGE_TOOL,
-  RECORD_VEHICLE_ID_TOOL,
+  RECORD_FOLLOWUP_INFO_TOOL,
   REQUEST_LIVE_AGENT_TOOL,
 } = require("../../server/persona");
 const { logCustomerField } = require("../../server/customerLog");
+const { notifyMessageTaken, notifyLeadUpdated } = require("../../server/notifications");
 const { loadConversation, saveConversation } = require("../../server/conversationStore");
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -50,17 +51,20 @@ function withCacheBreakpoint(history) {
   return copy;
 }
 
-async function notifyOwner(summary) {
-  try {
-    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    await client.messages.create({
-      from: process.env.TWILIO_PHONE_NUMBER,
-      to: process.env.OWNER_CELL_NUMBER,
-      body: summary,
-    });
-  } catch (err) {
-    console.error("Owner SMS alert failed:", err.message);
+// What's still outstanding from the follow-up text, and what the AI should say about it.
+// Each missing piece gets asked for ONCE - after that the owner gets it on the callback.
+function followupStatus(state) {
+  const missing = [];
+  if (state.awaitingVehicleId) missing.push("their VIN or license plate + state");
+  if (state.awaitingAddress) missing.push("the full address where the vehicle will be for service");
+  if (missing.length === 0) {
+    return "Everything's in. Thank them by name and let them know Chyne Tire has what it needs and will reach out to get them scheduled.";
   }
+  if (!state.followupNudged) {
+    state.followupNudged = true;
+    return `Recorded. Still missing: ${missing.join(" and ")}. Thank them by name and ask for it once, briefly.`;
+  }
+  return `Recorded. Still missing: ${missing.join(" and ")}, but you've already asked once - do NOT ask again. Thank them by name and let them know Chyne Tire will confirm anything else when they call.`;
 }
 
 exports.handler = async (event) => {
@@ -89,19 +93,19 @@ exports.handler = async (event) => {
   const state = existing || { history: [], captured: {}, awaitingVehicleId: false };
 
   if (mediaUrls.length > 0) {
-    const c = state.captured || {};
-    await notifyOwner(`Photo received via AI text for ${c.name || "a customer"} (likely VIN or registration):
-${mediaUrls.join("\n")}
-Vehicle on file: ${c.vehicle_year || ""} ${c.vehicle_make || ""} ${c.vehicle_model || ""}${bodyText ? `\nTheir message: ${bodyText}` : ""}
-From: ${from}`);
-    state.awaitingVehicleId = false;
+    state.captured = state.captured || {};
+    state.captured.photo_urls = [...(state.captured.photo_urls || []), ...mediaUrls];
+    if (bodyText) {
+      state.captured.notes = [state.captured.notes, `Texted with photo: ${bodyText}`].filter(Boolean).join("; ");
+    }
+    state.awaitingVehicleId = false; // the photo covers the VIN/plate - the owner reads it himself
+    await notifyLeadUpdated({ lead: state.captured, callerNumber: from });
 
     const note =
       `[System note: the customer just sent ${mediaUrls.length === 1 ? "a photo" : mediaUrls.length + " photos"}, ` +
       `most likely of their VIN or registration. It has ALREADY been forwarded to Chyne Tire - treat the ` +
-      `vehicle ID as received. Do NOT call record_vehicle_id for it and do NOT ask them to type it. ` +
-      `Thank them by name and let them know Chyne Tire has what's needed to get the right tires ready. ` +
-      `If they also wrote a message, respond to that naturally too.]`;
+      `vehicle ID as received and do NOT ask them to type it. If their message includes the service ` +
+      `address, call record_followup_info with just service_address. Otherwise: ${followupStatus(state)}]`;
     state.history.push({ role: "user", content: bodyText ? `${note}\n\n${bodyText}` : note });
   } else {
     state.history.push({ role: "user", content: bodyText });
@@ -117,7 +121,7 @@ From: ${from}`);
         model: "claude-sonnet-5",
         max_tokens: 300,
         system: CACHED_SYSTEM,
-        tools: [TAKE_MESSAGE_TOOL, RECORD_VEHICLE_ID_TOOL, REQUEST_LIVE_AGENT_TOOL],
+        tools: [TAKE_MESSAGE_TOOL, RECORD_FOLLOWUP_INFO_TOOL, REQUEST_LIVE_AGENT_TOOL],
         messages: withCacheBreakpoint(state.history),
       });
 
@@ -155,38 +159,18 @@ From: ${from}`);
 
       const takeMessageToolUse = message.content.find((b) => b.type === "tool_use" && b.name === "take_message");
       if (takeMessageToolUse) {
-        const {
-          name,
-          reason,
-          vehicle_year,
-          vehicle_make,
-          vehicle_model,
-          tire_size,
-          best_callback_time,
-        } = takeMessageToolUse.input;
+        const lead = { ...(state.captured || {}), ...takeMessageToolUse.input, channel: "text" };
+        await notifyMessageTaken({ lead, callerNumber: from });
+        logCustomerField({ phone: from, ...lead, source: "AI Text" });
 
-        await notifyOwner(`New text intake via AI answering:
-Name: ${name}
-Vehicle: ${vehicle_year} ${vehicle_make} ${vehicle_model}
-Tire size: ${tire_size}
-Reason: ${reason}
-Best time to call back: ${best_callback_time}
-Came in from: ${from}`);
+        state.captured = lead;
+        state.awaitingVehicleId = !(lead.vin || lead.plate || (lead.photo_urls && lead.photo_urls.length));
+        state.awaitingAddress = !lead.service_address;
+        state.followupNudged = true; // this next message IS the one ask
 
-        logCustomerField({
-          phone: from,
-          name,
-          reason,
-          vehicle_year,
-          vehicle_make,
-          vehicle_model,
-          tire_size,
-          best_callback_time,
-          source: "AI Text",
-        });
-
-        state.captured = { name, reason, vehicle_year, vehicle_make, vehicle_model, tire_size, best_callback_time };
-        state.awaitingVehicleId = true;
+        const ask = [];
+        if (state.awaitingVehicleId) ask.push("their VIN or license plate + state");
+        if (state.awaitingAddress) ask.push("the address where the vehicle will be when Chyne Tire comes out");
 
         state.history.push({
           role: "user",
@@ -194,42 +178,34 @@ Came in from: ${from}`);
             {
               type: "tool_result",
               tool_use_id: takeMessageToolUse.id,
-              content: "Message recorded. Now, in your next reply, thank them by name and directly ask for their VIN or license plate + state, per the VEHICLE-ID FOLLOW-UP instructions.",
+              content: ask.length
+                ? `Lead recorded. In your next reply, thank them by name and directly ask for ${ask.join(" plus ")}, per the FOLLOW-UP TEXT instructions.`
+                : "Lead recorded. Thank them by name and let them know Chyne Tire will reach out to get them scheduled.",
             },
           ],
         });
         continue;
       }
 
-      const vehicleIdToolUse = message.content.find((b) => b.type === "tool_use" && b.name === "record_vehicle_id");
-      if (vehicleIdToolUse) {
-        const { vin, plate, plate_state } = vehicleIdToolUse.input;
+      const followupToolUse = message.content.find((b) => b.type === "tool_use" && b.name === "record_followup_info");
+      if (followupToolUse) {
+        const { vin, plate, plate_state, service_address } = followupToolUse.input;
+        state.captured = state.captured || {};
+        if (vin) state.captured.vin = vin;
+        if (plate) state.captured.plate = plate;
+        if (plate_state) state.captured.plate_state = plate_state;
+        if (service_address) state.captured.service_address = service_address;
 
-        await notifyOwner(`Vehicle ID received via AI text for ${state.captured.name || "a customer"}:
-${vin ? `VIN: ${vin}` : `Plate: ${plate}${plate_state ? ` (${plate_state})` : ""}`}
-Vehicle on file: ${state.captured.vehicle_year || ""} ${state.captured.vehicle_make || ""} ${state.captured.vehicle_model || ""}
-From: ${from}`);
+        const c = state.captured;
+        state.awaitingVehicleId = !(c.vin || c.plate || (c.photo_urls && c.photo_urls.length));
+        state.awaitingAddress = !c.service_address;
 
-        logCustomerField({
-          phone: from,
-          ...state.captured,
-          vin,
-          plate,
-          plate_state,
-          source: "AI Text",
-        });
-
-        state.awaitingVehicleId = false;
+        await notifyLeadUpdated({ lead: c, callerNumber: from });
+        logCustomerField({ phone: from, ...c, source: "AI Text" });
 
         state.history.push({
           role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: vehicleIdToolUse.id,
-              content: "Vehicle ID recorded. Thank them by name and let them know Chyne Tire has what's needed to get the right tires ready.",
-            },
-          ],
+          content: [{ type: "tool_result", tool_use_id: followupToolUse.id, content: followupStatus(state) }],
         });
         continue;
       }
