@@ -43,7 +43,7 @@ app.post("/voice", (req, res) => {
       welcomeGreeting="Thanks for calling Chyne Tire! We come to you, by appointment. How can I help?"
     >
       <Language code="en-US" ttsProvider="ElevenLabs" />
-      <Language code="es-US" ttsProvider="ElevenLabs" voice="${SPANISH_VOICE_ID}" />
+      <Language code="es-US" ttsProvider="ElevenLabs" voice="${6VhI0BBMzbLqzPaeqUCz}" />
     </ConversationRelay>
   </Connect>
 </Response>`;
