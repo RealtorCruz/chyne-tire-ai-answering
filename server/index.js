@@ -134,17 +134,18 @@ wss.on("connection", (ws) => {
     clearTimeout(silenceTimer);
     silenceTimer = setTimeout(() => {
       callEnding = true;
+      const goodbye = currentTtsLanguage.startsWith("es")
+        ? "Parece que se cortó la llamada. Puede llamarnos de nuevo cuando guste. ¡Hasta luego!"
+        : "Looks like we may have gotten disconnected - feel free to call back anytime. Goodbye!";
       console.log(`Call ${callSid} ended: silence timeout`);
-      ws.send(
-        JSON.stringify({
-          type: "text",
-          token: "Looks like we may have gotten disconnected - feel free to call back anytime. Goodbye!",
-          last: true,
-          lang: currentTtsLanguage,
-        })
-      );
-      ws.send(JSON.stringify({ type: "end" }));
-      ws.close();
+      ws.send(JSON.stringify({ type: "text", token: goodbye, last: true, lang: currentTtsLanguage }));
+      // Wait for the goodbye to actually be spoken before hanging up - ending immediately
+      // (the old behavior) cut it off, so the caller just heard a click.
+      const words = goodbye.split(/\s+/).filter(Boolean).length;
+      setTimeout(() => {
+        ws.send(JSON.stringify({ type: "end" }));
+        ws.close();
+      }, Math.max(1500, words * 400) + 800);
     }, SILENCE_TIMEOUT_MS + extraDelayMs);
   }
 
@@ -176,6 +177,7 @@ wss.on("connection", (ws) => {
           currentTtsLanguage = "en-US";
         }
         console.log(`Call ${callSid}: detected lang=${msg.lang} -> using ${currentTtsLanguage}`);
+        console.log(`Call ${callSid} CALLER: ${msg.voicePrompt}`);
 
         // If the last turn is a pending tool_result (a save the AI made while speaking),
         // attach the caller's words to it instead of adding a second back-to-back user turn.
@@ -216,6 +218,7 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "interrupt") {
       resetSilenceTimer(); // caller talked over the AI - they're clearly still there
+      console.log(`Call ${callSid}: caller interrupted AI after: "${msg.utteranceUntilInterrupt || ""}"`);
       const last = history[history.length - 1];
       if (last && last.role === "assistant" && typeof last.content === "string") {
         last.content = msg.utteranceUntilInterrupt || last.content;
@@ -264,6 +267,7 @@ wss.on("connection", (ws) => {
       });
 
       const finalMessage = await stream.finalMessage();
+      console.log(`Call ${callSid} AI: ${fullText.trim() || "(no spoken text this turn)"}`);
 
       // Token/cache usage per turn - check Railway Deploy Logs to confirm caching is working
       // (cache_read should be large and input small after the first turn).
