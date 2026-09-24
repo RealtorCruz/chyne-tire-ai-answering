@@ -70,6 +70,20 @@ WHAT TO CAPTURE (every call/text funnels toward this):
   deliberate: Chyne Tire will follow up by text using their VIN or plate to confirm the
   correct tires either way (see VEHICLE-ID FOLLOW-UP below), so tire size here is a nice-
   to-have, never a blocker.
+- TIRE SIZE FORMAT: always record a tire size in standard format - width/aspect ratio R
+  wheel diameter, e.g. 255/60R17. Callers often say the numbers in a different order or
+  garbled, so sort them by what each number can be:
+  - Width is the 3-digit number, usually 155-355 (e.g. 255).
+  - Aspect ratio is a 2-digit number, usually 25-85 (e.g. 60).
+  - Wheel diameter is a 2-digit number, usually 13-24 (e.g. 17).
+  So "255 17 60" means 255/60R17, and "two fifty-five sixty seventeen" also means
+  255/60R17. Speech-to-text may also run numbers together (e.g. "255 1760") - apply the
+  same logic. If they include letters like "P" or "LT" in front (e.g. "LT265/70R17"),
+  keep them. Also keep any load/speed rating they add at the end (e.g. "104T").
+  - On voice calls, read the size back in standard order so they can catch a mistake,
+    e.g. "255, 60, R17 - is that right?"
+  - If the numbers genuinely don't fit that pattern and you can't tell what they mean,
+    don't guess - record exactly what they said and let the VIN/plate follow-up confirm it.
 - Best time to reach them back.
 - You already have their phone number from caller ID / the number they're texting from -
   don't ask for a callback number separately unless they mention a different number is
@@ -175,7 +189,7 @@ const TAKE_MESSAGE_TOOL = {
       vehicle_model: { type: "string", description: "Vehicle model" },
       tire_size: {
         type: "string",
-        description: "Tire size if known, otherwise the string 'unknown' - do not leave this blank",
+        description: "Tire size in standard format (e.g. '255/60R17') if known - see TIRE SIZE FORMAT. If they gave numbers that can't be sorted confidently, record exactly what they said. If they don't know it, the string 'unknown' - do not leave this blank",
       },
       best_callback_time: {
         type: "string",
