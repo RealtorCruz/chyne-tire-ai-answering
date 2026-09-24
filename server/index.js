@@ -10,7 +10,7 @@ const {
   REQUEST_LIVE_AGENT_TOOL,
   SAVE_PROGRESS_TOOL,
 } = require("./persona");
-const { notifyMessageTaken, notifyIncompleteMessage, sendVehicleIdRequestText } = require("./notifications");
+const { notifyMessageTaken, notifyIncompleteMessage, sendFollowupRequestText } = require("./notifications");
 const { logCustomerField } = require("./customerLog");
 const { saveConversation } = require("./conversationStore");
 
@@ -330,69 +330,38 @@ wss.on("connection", (ws) => {
       const toolUse = finalMessage.content.find((b) => b.type === "tool_use" && b.name === "take_message");
       if (toolUse) {
         messageTaken = true;
-        const {
-          name,
-          reason,
-          vehicle_year,
-          vehicle_make,
-          vehicle_model,
-          tire_size,
-          best_callback_time,
-        } = toolUse.input;
+        // Anything save_progress captured but the final take_message left out still counts.
+        const lead = { ...draftMessage, ...toolUse.input, channel: "call" };
 
-        await notifyMessageTaken({
-          name,
-          reason,
-          vehicle_year,
-          vehicle_make,
-          vehicle_model,
-          tire_size,
-          best_callback_time,
-          channel,
-          callerNumber,
-        });
+        await notifyMessageTaken({ lead, callerNumber });
 
-        logCustomerField({
-          phone: callerNumber,
-          name,
-          reason,
-          vehicle_year,
-          vehicle_make,
-          vehicle_model,
-          tire_size,
-          best_callback_time,
-          source: "AI Call",
-        });
+        logCustomerField({ phone: callerNumber, ...lead, source: "AI Call" });
 
-        // Kick off the text thread asking for VIN/plate - fire-and-forget the actual
-        // send, but AWAIT seeding conversationStore so it's saved before the call ends,
-        // otherwise a fast-replying customer could theoretically text back before this
-        // write finishes.
-        sendVehicleIdRequestText({
-          toNumber: callerNumber,
-          name,
-          vehicle_year,
-          vehicle_make,
-          vehicle_model,
-        })
+        // Kick off the follow-up text thread (VIN/plate + service address). The send is
+        // fire-and-forget, but seeding conversationStore happens right after so a
+        // customer who replies quickly still lands in the right thread.
+        sendFollowupRequestText({ toNumber: callerNumber, lead, lang: currentTtsLanguage })
           .then(async (result) => {
-            // Seed the text thread's persistent history. The Messages API requires the
-            // FIRST turn to be role "user" - so this can't just be the outbound
-            // assistant text on its own, or the real customer reply appended later
-            // (user) would collide role-order-wise the moment a second exchange
-            // happens. A synthetic system-note user turn ahead of it keeps the
-            // alternation valid (user, assistant, user, ...) and also doubles as
-            // exactly the context the model needs to address them by name and not
-            // re-ask anything once they do reply.
+            const needAddress = !lead.service_address;
+            const still = ["their VIN or license plate + state"];
+            if (needAddress) still.push("the full address where the vehicle will be for service");
+            // The Messages API requires the FIRST turn to be role "user", so a synthetic
+            // system-note user turn goes ahead of the outbound text. It also gives the
+            // model exactly the context it needs to address them by name and not re-ask
+            // anything once they reply.
             await saveConversation(callerNumber, {
               history: [
                 {
                   role: "user",
                   content:
-                    `[System note: ${name} just finished a call with Chyne Tire. Captured: ` +
-                    `vehicle ${vehicle_year} ${vehicle_make} ${vehicle_model}, tire size ${tire_size}, ` +
-                    `reason "${reason}", best callback time "${best_callback_time}". You just texted ` +
-                    `them asking for their VIN or license plate+state to confirm the exact right tires. ` +
+                    `[System note: ${lead.name} just finished a call with Chyne Tire. Captured: ` +
+                    `need "${lead.reason}"${lead.quantity ? ` (qty ${lead.quantity})` : ""}, ` +
+                    `vehicle ${lead.vehicle_year || ""} ${lead.vehicle_make || ""} ${lead.vehicle_model || ""}, ` +
+                    `tire size ${lead.tire_size || "unknown"}, city ${lead.service_city || "not given"}, ` +
+                    `${lead.service_address ? `service address ${lead.service_address}, ` : ""}` +
+                    `best callback time "${lead.best_callback_time || "no preference given"}". ` +
+                    `The call was in ${currentTtsLanguage.startsWith("es") ? "Spanish" : "English"}. ` +
+                    `You just texted them asking for ${still.join(" and ")}. ` +
                     `Do not respond to this note itself - it's context for whatever they text next.]`,
                 },
                 {
@@ -400,8 +369,10 @@ wss.on("connection", (ws) => {
                   content: [{ type: "text", text: result.body }],
                 },
               ],
-              captured: { name, reason, vehicle_year, vehicle_make, vehicle_model, tire_size, best_callback_time },
+              captured: lead,
               awaitingVehicleId: true,
+              awaitingAddress: needAddress,
+              followupNudged: false,
             });
           })
           .catch((err) => console.error("Failed to seed conversation state after voice intake:", err.message));
@@ -413,7 +384,9 @@ wss.on("connection", (ws) => {
               type: "tool_result",
               tool_use_id: toolUse.id,
               content:
-                "Message recorded. Now explain (out loud, don't ask for it on this call) that Chyne Tire will text them shortly asking for their VIN or license plate to confirm the exact right tires, then say goodbye and end the call.",
+                "Lead recorded. Now explain (out loud - don't collect either on this call) that Chyne Tire will text them shortly asking for their VIN or license plate" +
+                (lead.service_address ? "" : " and the address where the vehicle will be") +
+                ", then say goodbye and end the call.",
             },
           ],
         });
