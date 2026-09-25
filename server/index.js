@@ -11,7 +11,6 @@ const {
   SAVE_PROGRESS_TOOL,
 } = require("./persona");
 const { notifyMessageTaken, notifyIncompleteMessage, sendFollowupRequestText } = require("./notifications");
-const { logCustomerField } = require("./customerLog");
 const { saveConversation } = require("./conversationStore");
 
 const app = express();
@@ -336,7 +335,6 @@ wss.on("connection", (ws) => {
         if (tu.name === "save_progress") {
           Object.assign(draftMessage, tu.input);
           console.log(`Call ${callSid}: progress saved (${Object.keys(tu.input).join(", ")})`);
-          logCustomerField({ phone: callerNumber, source: "AI Call", ...draftMessage });
           toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Saved." });
           if (!fullText.trim()) savedSilently = true;
         } else if (tu.name === "log_live_agent_request") {
@@ -358,7 +356,6 @@ wss.on("connection", (ws) => {
 
           await notifyMessageTaken({ lead, callerNumber });
 
-          logCustomerField({ phone: callerNumber, ...lead, source: "AI Call" });
 
           // Kick off the follow-up text thread (service address, and a confirmation photo -
           // always requested, not just when tire size is unknown, since a stated size can
@@ -407,7 +404,7 @@ wss.on("connection", (ws) => {
             .catch((err) => console.error("Failed to seed conversation state after voice intake:", err.message));
 
           const explainParts = [];
-          if (needPhoto) explainParts.push("a quick photo of the sticker inside the driver's side door to double-check the tire size");
+          if (needPhoto) explainParts.push("a quick photo of the driver's-side door-jamb sticker to double-check the tire size");
           if (needAddress) explainParts.push("the address where the vehicle will be");
           toolResults.push({
             type: "tool_result",
