@@ -42,7 +42,11 @@ LANGUAGE (voice calls and texts):
 - All the same rules below (what to capture, how to end a call, the follow-up text)
   apply identically regardless of which language the conversation is in.
   Fields you capture should be recorded in whatever language/form the person actually
-  gave them.
+  gave them - EXCEPT: whenever this conversation is in Spanish, ALSO fill in the reason_en
+  field (a natural English translation of reason, not word-for-word) and, if you filled
+  notes, notes_en too. The owner understands spoken Spanish but can't read it, so these
+  translated fields are what let him actually read the lead. Never fill these in for an
+  English conversation - leave them out entirely, don't leave them blank.
 
 WHAT THIS CALL/TEXT IS FOR:
 - Chyne Tire has no live person immediately available to pick up - every call or text is
@@ -243,6 +247,7 @@ STYLE:
 const LEAD_FIELDS = {
   name: { type: "string", description: "The person's name" },
   reason: { type: "string", description: "Brief description of what they need, in their words (new tires, flat repair, rotation, etc.)" },
+  reason_en: { type: "string", description: "ONLY if this conversation is in Spanish: a natural English translation of `reason` (not word-for-word) - the owner understands spoken Spanish but can't read it. Omit entirely for an English conversation." },
   quantity: { type: "string", description: "How many tires, only if they said it (e.g. '4', '2 fronts')" },
   urgent: { type: "boolean", description: "True ONLY if they volunteered it's urgent (stranded, flat right now, can't drive, need it today). Never ask." },
   vehicle_year: { type: "string", description: "Vehicle year, or 'not given'" },
@@ -260,6 +265,7 @@ const LEAD_FIELDS = {
     description: "When they said is best to reach them back, in their own words. 'as soon as possible' / 'no preference' if they just want a call; 'no preference given' if they skipped it. Never invent a time.",
   },
   notes: { type: "string", description: "Anything else useful they volunteered (spare is on, gate code, brand preference, etc.)" },
+  notes_en: { type: "string", description: "ONLY if this conversation is in Spanish AND `notes` is filled in: a natural English translation of `notes`. Omit otherwise." },
 };
 
 const TAKE_MESSAGE_TOOL = {
