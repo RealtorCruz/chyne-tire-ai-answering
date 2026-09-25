@@ -3,7 +3,7 @@
 // WHY THIS EXISTS: the real-estate reference build (sms.js) kept conversation history in
 // a plain in-memory JS Map inside the Netlify Function - which that file's own comment
 // admits resets on cold start. That's fine for quick personal testing, but wrong for
-// Chyne Tire's actual requirement: a customer might not text back their VIN/plate for
+// Chyne Tire's actual requirement: a customer might not text back their follow-up photo for
 // hours, and by then the function has almost certainly cold-started and forgotten
 // everything - the conversation would silently "start over" and re-introduce itself,
 // which is exactly what was ruled out.
