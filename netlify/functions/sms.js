@@ -10,9 +10,9 @@
 //
 // UNLIKE the real-estate reference build, conversation state here is NOT kept in an
 // in-memory Map (that resets on every cold start, which would make the thread silently
-// "start over" if a customer takes hours to text back their VIN/plate - exactly what
-// isn't allowed). State is loaded from and saved back to conversationStore.js
-// (Netlify Blobs) on every single request instead.
+// "start over" if a customer takes hours to text back their follow-up photo/address -
+// exactly what isn't allowed). State is loaded from and saved back to
+// conversationStore.js (Netlify Blobs) on every single request instead.
 
 const Anthropic = require("@anthropic-ai/sdk");
 const twilio = require("twilio");
@@ -24,6 +24,7 @@ const {
 } = require("../../server/persona");
 const { logCustomerField } = require("../../server/customerLog");
 const { notifyMessageTaken, notifyLeadUpdated } = require("../../server/notifications");
+const { fetchAndStorePhoto } = require("../../server/photoStore");
 const { loadConversation, saveConversation } = require("../../server/conversationStore");
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -72,9 +73,9 @@ exports.handler = async (event) => {
   const from = params.get("From");
   const bodyText = (params.get("Body") || "").trim();
 
-  // Photo texts (MMS): customers will often send a picture of their registration card or
-  // VIN sticker instead of typing it. The AI doesn't read the photo - Chyne Tire does -
-  // so we just forward the photo link(s) to the owner and have the AI thank them.
+  // Photo texts (MMS): this is the door-jamb sticker photo we ask for in the follow-up
+  // text. The AI doesn't read the photo - Chyne Tire does - so we just forward the
+  // photo link(s) to the owner and have the AI thank them.
   const numMedia = parseInt(params.get("NumMedia") || "0", 10);
   const mediaUrls = [];
   for (let i = 0; i < numMedia; i++) {
@@ -93,8 +94,19 @@ exports.handler = async (event) => {
   const state = existing || { history: [], captured: {}, awaitingTireSizePhoto: false, awaitingAddress: false };
 
   if (mediaUrls.length > 0) {
+    // Re-host each photo (see photoStore.js) instead of forwarding Twilio's own media
+    // URLs - those require Twilio login credentials to view, which Mark should never
+    // need. Fetching happens once, right now, while our server still has the Twilio
+    // credentials to do it; a failed fetch is skipped rather than crashing the text.
+    const rehostedUrls = [];
+    for (const twilioUrl of mediaUrls) {
+      const publicUrl = await fetchAndStorePhoto(twilioUrl);
+      if (publicUrl) rehostedUrls.push(publicUrl);
+      else console.error(`sms.js: failed to re-host photo, dropping from lead: ${twilioUrl}`);
+    }
+
     state.captured = state.captured || {};
-    state.captured.photo_urls = [...(state.captured.photo_urls || []), ...mediaUrls];
+    state.captured.photo_urls = [...(state.captured.photo_urls || []), ...rehostedUrls];
     if (bodyText) {
       state.captured.notes = [state.captured.notes, `Texted with photo: ${bodyText}`].filter(Boolean).join("; ");
     }
