@@ -22,7 +22,6 @@ const {
   RECORD_FOLLOWUP_INFO_TOOL,
   REQUEST_LIVE_AGENT_TOOL,
 } = require("../../server/persona");
-const { logCustomerField } = require("../../server/customerLog");
 const { notifyMessageTaken, notifyLeadUpdated } = require("../../server/notifications");
 const { fetchAndStorePhoto } = require("../../server/photoStore");
 const { loadConversation, saveConversation } = require("../../server/conversationStore");
@@ -174,7 +173,6 @@ exports.handler = async (event) => {
       if (takeMessageToolUse) {
         const lead = { ...(state.captured || {}), ...takeMessageToolUse.input, channel: "text" };
         await notifyMessageTaken({ lead, callerNumber: from });
-        logCustomerField({ phone: from, ...lead, source: "AI Text" });
 
         state.captured = lead;
         // Always requested unless a photo already came in on this thread - not conditional
@@ -219,7 +217,6 @@ exports.handler = async (event) => {
         state.awaitingAddress = !c.service_address;
 
         if (addressIsNew) await notifyLeadUpdated({ lead: c, callerNumber: from });
-        logCustomerField({ phone: from, ...c, source: "AI Text" });
 
         state.history.push({
           role: "user",
