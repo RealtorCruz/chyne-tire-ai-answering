@@ -318,128 +318,122 @@ wss.on("connection", (ws) => {
       );
       history.push({ role: "assistant", content: cleanContent });
 
-      const saveProgressToolUse = finalMessage.content.find(
-        (b) => b.type === "tool_use" && b.name === "save_progress"
-      );
-      if (saveProgressToolUse) {
-        Object.assign(draftMessage, saveProgressToolUse.input);
-        console.log(`Call ${callSid}: progress saved (${Object.keys(saveProgressToolUse.input).join(", ")})`);
-        logCustomerField({ phone: callerNumber, source: "AI Call", ...draftMessage });
-        history.push({
-          role: "user",
-          content: [{ type: "tool_result", tool_use_id: saveProgressToolUse.id, content: "Saved." }],
-        });
-        // If the AI already spoke in this same turn (the normal Sonnet pattern: talk + save
-        // together), DON'T prompt it again - that's what made it repeat itself. Just wait
-        // for the caller; their next words get attached to this tool_result turn (see the
-        // "prompt" handler). Only re-prompt if the save was silent, so the caller isn't
-        // left in dead air.
-        if (fullText.trim()) return;
-        await respond(ws, history, channel, callerNumber);
-        return;
+      // CRITICAL: Sonnet can return MORE THAN ONE tool_use block in a single turn (e.g.
+      // saving a detail AND logging a live-agent request in the same reply). The API
+      // requires every tool_use in a turn to get a matching tool_result in the very next
+      // message - so ALL tool calls in this turn must be collected and answered together
+      // in ONE combined user turn, never handled one-at-a-time with an early return. A
+      // dangling, unanswered tool_use is exactly what silently broke the rest of a real
+      // call tonight: every subsequent turn failed with the same 400 error once one
+      // tool_use was left without its result.
+      const toolUses = finalMessage.content.filter((b) => b.type === "tool_use");
+      const toolResults = [];
+      let mustContinue = false; // some tool result requires an immediate follow-up turn
+      let savedSilently = false; // save_progress fired with nothing spoken this turn
+      let endCallRequested = false;
+
+      for (const tu of toolUses) {
+        if (tu.name === "save_progress") {
+          Object.assign(draftMessage, tu.input);
+          console.log(`Call ${callSid}: progress saved (${Object.keys(tu.input).join(", ")})`);
+          logCustomerField({ phone: callerNumber, source: "AI Call", ...draftMessage });
+          toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Saved." });
+          if (!fullText.trim()) savedSilently = true;
+        } else if (tu.name === "log_live_agent_request") {
+          liveAgentRequestCount += 1;
+          const reachedThreshold = liveAgentRequestCount >= 3;
+          console.log(`Call ${callSid}: live-agent request logged (count=${liveAgentRequestCount})`);
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: reachedThreshold
+              ? `This is request #${liveAgentRequestCount} - the threshold has been reached. Begin the escalation script now: acknowledge their request, briefly explain you need a few details to set up a callback, then ask for their name and best time to call back together in one question. Follow the normal read-back-and-confirm flow before recording anything, then say goodbye and end the call.`
+              : `This is request #${liveAgentRequestCount} of 3 needed before escalating. Keep trying to help them directly and naturally - don't mention any request count or threshold. Only begin the escalation script once told the threshold is reached.`,
+          });
+          mustContinue = true;
+        } else if (tu.name === "take_message") {
+          messageTaken = true;
+          // Anything save_progress captured but the final take_message left out still counts.
+          const lead = { ...draftMessage, ...tu.input, channel: "call" };
+
+          await notifyMessageTaken({ lead, callerNumber });
+
+          logCustomerField({ phone: callerNumber, ...lead, source: "AI Call" });
+
+          // Kick off the follow-up text thread (service address, and a confirmation photo -
+          // always requested, not just when tire size is unknown, since a stated size can
+          // still be wrong for the car). The send is fire-and-forget, but seeding
+          // conversationStore happens right after so a customer who replies quickly still
+          // lands in the right thread.
+          const needAddress = !lead.service_address;
+          const needPhoto = true; // no photo could exist yet at voice intake time
+          sendFollowupRequestText({ toNumber: callerNumber, lead, lang: currentTtsLanguage })
+            .then(async (result) => {
+              const still = [];
+              if (needPhoto) still.push("a photo of the driver's-side door-jamb sticker (to double-check the tire size)");
+              if (needAddress) still.push("the full address where the vehicle will be for service");
+              // The Messages API requires the FIRST turn to be role "user", so a synthetic
+              // system-note user turn goes ahead of the outbound text. It also gives the
+              // model exactly the context it needs to address them by name and not re-ask
+              // anything once they reply.
+              await saveConversation(callerNumber, {
+                history: [
+                  {
+                    role: "user",
+                    content:
+                      `[System note: ${lead.name} just finished a call with Chyne Tire. Captured: ` +
+                      `need "${lead.reason}"${lead.quantity ? ` (qty ${lead.quantity})` : ""}, ` +
+                      `vehicle ${lead.vehicle_year || ""} ${lead.vehicle_make || ""} ${lead.vehicle_model || ""}, ` +
+                      `tire size ${lead.tire_size || "unknown"}, city ${lead.service_city || "not given"}, ` +
+                      `${lead.service_address ? `service address ${lead.service_address}, ` : ""}` +
+                      `best callback time "${lead.best_callback_time || "no preference given"}". ` +
+                      `The call was in ${currentTtsLanguage.startsWith("es") ? "Spanish" : "English"}. ` +
+                      (still.length
+                        ? `You just texted them asking for ${still.join(" and ")}. `
+                        : `You already have everything needed, no follow-up ask was sent. `) +
+                      `Do not respond to this note itself - it's context for whatever they text next.]`,
+                  },
+                  {
+                    role: "assistant",
+                    content: [{ type: "text", text: result.body }],
+                  },
+                ],
+                captured: lead,
+                awaitingTireSizePhoto: needPhoto,
+                awaitingAddress: needAddress,
+                followupNudged: false,
+              });
+            })
+            .catch((err) => console.error("Failed to seed conversation state after voice intake:", err.message));
+
+          const explainParts = [];
+          if (needPhoto) explainParts.push("a quick photo of the sticker inside the driver's side door to double-check the tire size");
+          if (needAddress) explainParts.push("the address where the vehicle will be");
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: explainParts.length
+              ? `Lead recorded. Now explain (out loud - don't collect this on the call) that Chyne Tire will text them shortly asking for ${explainParts.join(" and ")}, then say goodbye and end the call.`
+              : "Lead recorded. Now let them know Chyne Tire has everything needed and will be in touch, then say goodbye and end the call.",
+          });
+          mustContinue = true;
+        } else if (tu.name === "end_call") {
+          endCallRequested = true;
+          // Still needs a tool_result even though the call is ending - if end_call somehow
+          // fired alongside another tool this turn (against instructions, but defensively
+          // handled), every tool_use still needs an answer or the NEXT call's first turn
+          // would inherit this same corruption.
+          toolResults.push({ type: "tool_result", tool_use_id: tu.id, content: "Call ending." });
+        }
       }
 
-      const liveAgentToolUse = finalMessage.content.find(
-        (b) => b.type === "tool_use" && b.name === "log_live_agent_request"
-      );
-      if (liveAgentToolUse) {
-        liveAgentRequestCount += 1;
-        const reachedThreshold = liveAgentRequestCount >= 3;
-        console.log(`Call ${callSid}: live-agent request logged (count=${liveAgentRequestCount})`);
-        history.push({
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: liveAgentToolUse.id,
-              content: reachedThreshold
-                ? `This is request #${liveAgentRequestCount} - the threshold has been reached. Begin the escalation script now: acknowledge their request, briefly explain you need a few details to set up a callback, then ask for their name and best time to call back together in one question. Follow the normal read-back-and-confirm flow before recording anything, then say goodbye and end the call.`
-                : `This is request #${liveAgentRequestCount} of 3 needed before escalating. Keep trying to help them directly and naturally - don't mention any request count or threshold. Only begin the escalation script once told the threshold is reached.`,
-            },
-          ],
-        });
-        await respond(ws, history, channel, callerNumber);
-        return;
+      // ALL tool results from this turn go into ONE combined user turn - never split
+      // across multiple pushes, which is what let a tool_use get left unanswered before.
+      if (toolResults.length > 0) {
+        history.push({ role: "user", content: toolResults });
       }
 
-      const toolUse = finalMessage.content.find((b) => b.type === "tool_use" && b.name === "take_message");
-      if (toolUse) {
-        messageTaken = true;
-        // Anything save_progress captured but the final take_message left out still counts.
-        const lead = { ...draftMessage, ...toolUse.input, channel: "call" };
-
-        await notifyMessageTaken({ lead, callerNumber });
-
-        logCustomerField({ phone: callerNumber, ...lead, source: "AI Call" });
-
-        // Kick off the follow-up text thread (service address, and a confirmation photo -
-        // always requested, not just when tire size is unknown, since a stated size can
-        // still be wrong for the car). The send is fire-and-forget, but seeding
-        // conversationStore happens right after so a customer who replies quickly still
-        // lands in the right thread.
-        const needAddress = !lead.service_address;
-        const needPhoto = true; // no photo could exist yet at voice intake time
-        sendFollowupRequestText({ toNumber: callerNumber, lead, lang: currentTtsLanguage })
-          .then(async (result) => {
-            const still = [];
-            if (needPhoto) still.push("a photo of the driver's-side door-jamb sticker (to double-check the tire size)");
-            if (needAddress) still.push("the full address where the vehicle will be for service");
-            // The Messages API requires the FIRST turn to be role "user", so a synthetic
-            // system-note user turn goes ahead of the outbound text. It also gives the
-            // model exactly the context it needs to address them by name and not re-ask
-            // anything once they reply.
-            await saveConversation(callerNumber, {
-              history: [
-                {
-                  role: "user",
-                  content:
-                    `[System note: ${lead.name} just finished a call with Chyne Tire. Captured: ` +
-                    `need "${lead.reason}"${lead.quantity ? ` (qty ${lead.quantity})` : ""}, ` +
-                    `vehicle ${lead.vehicle_year || ""} ${lead.vehicle_make || ""} ${lead.vehicle_model || ""}, ` +
-                    `tire size ${lead.tire_size || "unknown"}, city ${lead.service_city || "not given"}, ` +
-                    `${lead.service_address ? `service address ${lead.service_address}, ` : ""}` +
-                    `best callback time "${lead.best_callback_time || "no preference given"}". ` +
-                    `The call was in ${currentTtsLanguage.startsWith("es") ? "Spanish" : "English"}. ` +
-                    (still.length
-                      ? `You just texted them asking for ${still.join(" and ")}. `
-                      : `You already have everything needed, no follow-up ask was sent. `) +
-                    `Do not respond to this note itself - it's context for whatever they text next.]`,
-                },
-                {
-                  role: "assistant",
-                  content: [{ type: "text", text: result.body }],
-                },
-              ],
-              captured: lead,
-              awaitingTireSizePhoto: needPhoto,
-              awaitingAddress: needAddress,
-              followupNudged: false,
-            });
-          })
-          .catch((err) => console.error("Failed to seed conversation state after voice intake:", err.message));
-
-        const explainParts = [];
-        if (needPhoto) explainParts.push("a quick photo of the sticker inside the driver's side door to double-check the tire size");
-        if (needAddress) explainParts.push("the address where the vehicle will be");
-        history.push({
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              tool_use_id: toolUse.id,
-              content: explainParts.length
-                ? `Lead recorded. Now explain (out loud - don't collect this on the call) that Chyne Tire will text them shortly asking for ${explainParts.join(" and ")}, then say goodbye and end the call.`
-                : "Lead recorded. Now let them know Chyne Tire has everything needed and will be in touch, then say goodbye and end the call.",
-            },
-          ],
-        });
-
-        await respond(ws, history, channel, callerNumber);
-        return;
-      }
-
-      const endCallToolUse = finalMessage.content.find((b) => b.type === "tool_use" && b.name === "end_call");
-      if (endCallToolUse) {
+      if (endCallRequested) {
         callEnding = true;
         clearTimeout(silenceTimer);
 
@@ -458,7 +452,23 @@ wss.on("connection", (ws) => {
           ws.send(JSON.stringify({ type: "end" }));
           ws.close();
         }, speakingDelayMs);
+        return;
       }
+
+      if (mustContinue) {
+        await respond(ws, history, channel, callerNumber);
+        return;
+      }
+
+      if (savedSilently) {
+        // A save_progress fired with nothing spoken this turn and nothing else requiring
+        // continuation - re-prompt so the caller isn't left in dead air.
+        await respond(ws, history, channel, callerNumber);
+        return;
+      }
+      // Otherwise: either nothing happened but plain speech, or save_progress fired
+      // alongside actual spoken text - wait for the caller, per the original fix for the
+      // repeat-itself bug (their next words attach to this turn via the "prompt" handler).
     } catch (err) {
       console.error("Error generating response:", err);
       const errorMessage = currentTtsLanguage.startsWith("es")
