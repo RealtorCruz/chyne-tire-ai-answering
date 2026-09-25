@@ -2,7 +2,7 @@
 //
 // OWNER ALERTS use one "lead card" format: the first alert (NEW) goes out the moment
 // the lead is captured so hot leads can be called right away; every time the customer
-// later texts in their VIN/plate/photo/address, the owner gets the WHOLE card again
+// later texts in their door-jamb photo/address, the owner gets the WHOLE card again
 // marked UPDATED - so whichever alert he opens last is the complete lead, and he never
 // has to piece fragments together.
 //
@@ -25,8 +25,9 @@ async function sendSms(to, body, mediaUrl) {
 
 // Public URL of the door-jamb reference photo, served as a static file from this same
 // Netlify site (see /assets/doorjamb-sticker.jpg in the repo). ~86KB -> costs about
-// $0.04 per send (Twilio MMS: $0.02 base + $0.02/100KB), only sent when tire size is
-// unknown. Update DOORJAMB_PHOTO_HOST if the Netlify site name ever changes.
+// $0.04 per send (Twilio MMS: $0.02 base + $0.02/100KB). Sent on every lead's follow-up
+// text (whether or not a tire size was given) unless a photo has already come in on
+// that thread. Update DOORJAMB_PHOTO_HOST if the Netlify site name ever changes.
 const DOORJAMB_PHOTO_HOST = process.env.DOORJAMB_PHOTO_HOST || "https://chyne-tire-ai-answering.netlify.app";
 const DOORJAMB_PHOTO_URL = `${DOORJAMB_PHOTO_HOST}/assets/doorjamb-sticker.jpg`;
 
@@ -38,6 +39,17 @@ function vehicleText(lead) {
 }
 
 // Builds the full lead card from everything known so far.
+// Strips accents/diacritics from a string (é->e, ñ->n, etc.) using Unicode normalization:
+// NFD splits an accented character into its base letter + a separate combining accent
+// mark, which the regex then removes, leaving plain ASCII. This keeps the owner's lead
+// card in GSM/plain encoding (160 chars/segment) even when it contains a Spanish
+// customer's own words - a single accented character anywhere in a text switches the
+// WHOLE message to UCS-2 encoding (67 chars/segment), which can turn a normal 2-segment
+// card into 5+ segments for the sake of one accent mark.
+function stripAccents(str) {
+  return str.normalize("NFD").replace(/[̀-ͯ]/g, "");
+}
+
 function formatLeadCard(lead, { phone, updated, header }) {
   const lines = [];
   lines.push(
@@ -61,13 +73,39 @@ function formatLeadCard(lead, { phone, updated, header }) {
   if (lead.notes) lines.push(`Notes: ${lead.notes}`);
   lines.push(`Phone: ${phone}`);
   lines.push(`Came in by: ${lead.channel === "text" ? "text" : "call"}`);
-  return lines.join("\n");
+  // Strip accents from the WHOLE card, not just the fields likely to have Spanish words -
+  // this guarantees the card stays cheap regardless of which field an accent shows up in
+  // (a name, a city, anything free-text).
+  return stripAccents(lines.join("\n"));
+}
+
+// If the AI filled in an English translation (see reason_en/notes_en in persona.js -
+// only happens on a Spanish-language lead), sends a short SECOND text with the original
+// Spanish alongside its translation, so the owner - who understands spoken Spanish but
+// can't read it - can actually read what the customer said. Kept as its OWN separate
+// text rather than folded into the main card: the main card must stay accent-free to
+// hold its cheap encoding (see stripAccents above), but this companion text needs the
+// real accented original to be worth anything, so it's allowed to cost the pricier
+// encoding - it's short, and only sent once, at intake, not on every later update.
+async function sendSpanishTranslationText(lead) {
+  if (!lead.reason_en) return; // no translation to send - not a Spanish lead
+  const lines = [`Lead was in Spanish - here's what they said, translated:`];
+  lines.push(`"${lead.reason}" -> "${lead.reason_en}"`);
+  if (lead.notes && lead.notes_en) {
+    lines.push(`Notes: "${lead.notes}" -> "${lead.notes_en}"`);
+  }
+  try {
+    await sendSms(process.env.OWNER_CELL_NUMBER, lines.join("\n"));
+  } catch (err) {
+    console.error("Failed to send Spanish translation text:", err.message);
+  }
 }
 
 // NEW lead card - sent the moment take_message fires (call or text).
 async function notifyMessageTaken({ lead, callerNumber }) {
   try {
     await sendSms(process.env.OWNER_CELL_NUMBER, formatLeadCard(lead, { phone: callerNumber, updated: false }));
+    await sendSpanishTranslationText(lead);
     return "sent";
   } catch (err) {
     console.error("Failed to send owner SMS alert:", err.message);
@@ -75,7 +113,7 @@ async function notifyMessageTaken({ lead, callerNumber }) {
   }
 }
 
-// UPDATED lead card - sent whenever the customer texts in VIN/plate/photo/address.
+// UPDATED lead card - sent whenever the customer texts in their door-jamb photo/address.
 async function notifyLeadUpdated({ lead, callerNumber }) {
   try {
     await sendSms(process.env.OWNER_CELL_NUMBER, formatLeadCard(lead, { phone: callerNumber, updated: true }));
@@ -113,10 +151,10 @@ async function notifyIncompleteMessage({ callerNumber, requestCount, draft }) {
   }
 }
 
-// Sent to the CUSTOMER right after a VOICE call's take_message fires - asks for the
-// VIN/plate and (unless they already gave it) the service address, and kicks off the
-// text thread conversationStore.js keeps alive until they reply. Sent in Spanish if the
-// call was in Spanish.
+// Sent to the CUSTOMER right after a VOICE call's take_message fires - asks for a
+// confirmation photo and (unless they already gave it) the service address, and kicks
+// off the text thread conversationStore.js keeps alive until they reply. Sent in
+// Spanish if the call was in Spanish.
 async function sendFollowupRequestText({ toNumber, lead, lang }) {
   const name = lead.name || "";
   const needAddress = !lead.service_address;
